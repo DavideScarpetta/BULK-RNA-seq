@@ -1,0 +1,229 @@
+# This is the R code of my BULK RNA-seq analysis
+
+# Calling libraries
+
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(RColorBrewer)
+library(AnnotationDbi)
+library("org.Hs.eg.db")
+
+# Pre-processing
+
+# Creating a function that given the rse object and the selected column gives us back the wanted stats
+
+clean <- function(rse, columns) {
+  
+  # Load the dataset and select the columns
+  dataset <- get(load(rse))
+  dataset <- dataset[,columns]
+  
+  # Set the conditions for filtering
+  length_condition <- dataset@rowRanges$bp_length>=200
+  chrM_condition <- as.vector(seqnames(dataset@rowRanges)!="chrM")
+  
+  # Get the count table and compute results from filtering
+  count_table <- assays(dataset)[[1]]
+  total_reads <- colSums(count_table)
+  
+  # Count short reads
+  short_reads <- colSums(count_table[!length_condition,])
+  short_reads_perc <- (short_reads/total_reads)*100
+  
+  # Count reads on mt genes
+  mt_reads <- colSums(count_table[!chrM_condition & length_condition,])
+  mt_reads_perc <- (mt_reads/total_reads)*100
+  
+  # Filter the dataset
+  dataset <- dataset[length_condition & chrM_condition,]
+  # Return a list with the processed dataset and the results from filtering
+  result = list(dataset = dataset, total_reads = total_reads,
+                short_reads = short_reads, short_reads_perc = short_reads_perc,
+                mt_reads = mt_reads, mt_reads_perc = mt_reads_perc)
+  return(result)
+}
+
+# Loading and pre-processing the data
+
+brain_preprocessed <- clean("rse_gene_brain_9_scaled.Rdata", c(6,7,8))
+
+heart_preprocessed <- clean("rse_gene_heart_6_scaled.Rdata", c(6,7,8))
+
+kidney_preprocessed <- clean("rse_gene_kidney_7_scaled.Rdata", c(10,1,2))
+
+# The following are the resulting pre-processing statistics:
+
+brain_tab <- vapply(brain_preprocessed[2:6], unlist, numeric(3))
+heart_tab <- vapply(heart_preprocessed[2:6], unlist, numeric(3))
+kidney_tab <- vapply(kidney_preprocessed[2:6], unlist, numeric(3))
+
+tab <- as.data.frame(rbind(brain_tab, heart_tab, kidney_tab))
+head(tab)
+
+# The three filtered datasets are then stored in a single RangedSummarizedExperiment object in order to perform the analysis and the count table is extracted
+
+merged_dataset <- cbind(brain_preprocessed$dataset, heart_preprocessed$dataset,
+                        kidney_preprocessed$dataset)
+count_table <- assays(merged_dataset)[[1]]
+
+# Creating the dataframe of the metadata
+
+metadata <- data.frame(c("SRR1455060", "SRR664854", "SRR1337909", "SRR1442648", "SRR1486174", "SRR1349433",
+                         "SRR1490658", "SRR1325483", "SRR1443092"), c("brain", "brain", "brain", "heart", "heart",
+                                                                      "heart", "kidney", "kidney", "kidney"))
+
+rownames(metadata) <- c("SRR1455060", "SRR664854", "SRR1337909", "SRR1442648", "SRR1486174", "SRR1349433",
+                        "SRR1490658", "SRR1325483", "SRR1443092")
+colnames(metadata)[2] <- "genotype"
+colnames(metadata)[1] <- "sample"
+metadata <- as.matrix(metadata)
+counts <- assay(merged_dataset)
+
+
+### DESeq2 Analysis
+
+# First, checking in the rawnames of the metadata are the same of the colnames of the counts
+
+all(rownames(metadata) == colnames(counts))
+
+# Then creating the object, filtering out genes with low expression and normalizating
+
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = metadata,
+                              design = ~ 0 + genotype)
+                              
+# Filtering out genes with low expression
+
+keep <- rowSums(counts(dds)) >= 5
+dds <- dds[keep,]
+
+# Normalization
+
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+
+normalized_counts <- counts(dds, normalized = TRUE)
+head.Vector(normalized_counts)
+
+# Boxplot of the log2(normalized_counts)
+
+boxplot(log2(normalized_counts), notch=TRUE, outline = FALSE, col = c(rep('green', 3), rep('lightblue', 3), rep('orange', 3)),
+        main = "Normalized read counts", ylab="log2(read counts)", cex = 0.6, las=2)
+        
+# Log transform the normalized counts to improve the visualization of the clustering
+
+vsd <- vst(dds, blind = TRUE)
+
+# Extract the vst matrix from the object
+
+vsd_mat <- assay(vsd)
+head(vsd_mat)
+
+# PCA
+
+plotPCA(vsd, intgroup = "genotype")
+
+# Mean-variance relationship
+
+# Calculating mean for each gene (each row)
+
+mean_counts <- apply(counts[, 1:9], 1, mean)
+
+# Calculating variance for each gene
+
+var_counts <- apply(counts[,1:9], 1, var)
+
+# Creating a dataframe in order to plot mean-variance relationship
+
+df <- data.frame(mean_counts, var_counts)
+
+# Plotting it using ggplot2
+
+ggplot(df) +
+  geom_point(aes(x=mean_counts, y=var_counts)) +
+  scale_y_log10() +
+  scale_x_log10() +
+  xlab("Mean counts per gene") +
+  ylab("Variance counts per gene")
+
+# Run the DESeq2 analysis
+
+dds <- DESeq(dds)
+
+# Plotting the dispersion estimates
+
+plotDispEsts(dds)
+
+# Making the contrasts
+
+b_vs_h <- results(dds, contrast = c("genotype", "brain", "heart"))
+b_vs_h <- b_vs_h[which(abs(b_vs_h$log2FoldChange) > 3 & b_vs_h$padj < 0.01), ]
+
+b_vs_k <- results(dds, contrast = c("genotype", "brain", "kidney"))
+b_vs_k <- b_vs_k[which(abs(b_vs_k$log2FoldChange) > 3 & b_vs_k$padj < 0.01), ]
+
+h_vs_k <- results(dds, contrast = c("genotype", "heart", "kidney"))
+h_vs_k <- h_vs_k[which(abs(h_vs_k$log2FoldChange) > 3 & h_vs_k$padj < 0.01), ]
+
+# Converting the ENS accession in a GENE NAME, I will do it using the “mapIds” function from the package AnnotationDbi
+
+# The rownames are ENSG---."number", so i have to extract the ENSG without the final part
+
+ENSG_b_vs_h <- substr(rownames(b_vs_h), 1, 15)
+
+b_vs_h$symbol <- mapIds(org.Hs.eg.db,
+                        keys=ENSG_b_vs_h,
+                        column="SYMBOL",
+                        keytype="ENSEMBL",
+                        multiVals="first")
+                        
+# Dividing up-regolated genes vs down-regolated genes
+
+up_b_vs_h <- b_vs_h[b_vs_h$log2FoldChange > 0, ]
+down_b_vs_h <- b_vs_h[b_vs_h$log2FoldChange < 0, ]
+
+# Second comparison
+
+ENSG_b_vs_k <- substr(rownames(b_vs_k), 1, 15)
+
+b_vs_k$symbol <- mapIds(org.Hs.eg.db,
+                        keys=ENSG_b_vs_k,
+                        column="SYMBOL",
+                        keytype="ENSEMBL",
+                        multiVals="first")
+                        
+# Dividing up-regolated genes vs down-regolated genes
+
+up_b_vs_k <- b_vs_k[b_vs_k$log2FoldChange > 0, ]
+down_b_vs_k <- b_vs_k[b_vs_k$log2FoldChange < 0, ]
+
+# Third comparison
+
+ENSG_h_vs_k <- substr(rownames(h_vs_k), 1, 15)
+
+h_vs_k$symbol <- mapIds(org.Hs.eg.db,
+                        keys=ENSG_h_vs_k,
+                        column="SYMBOL",
+                        keytype="ENSEMBL",
+                        multiVals="first")
+                        
+# Dividing up-regolated genes vs down-regolated genes
+
+up_h_vs_k <- h_vs_k[h_vs_k$log2FoldChange > 0, ]
+down_h_vs_k <- h_vs_k[h_vs_k$log2FoldChange < 0, ]
+
+# Now searching for up regolated genes in both comparisons
+
+up_brain <- intersect(up_b_vs_h$symbol, up_b_vs_k$symbol)
+up_heart <- intersect(down_b_vs_h$symbol, up_h_vs_k$symbol)
+up_kidney <- intersect(down_b_vs_k$symbol, down_h_vs_k$symbol)
+
+down_brain <- intersect(down_b_vs_h$symbol, down_b_vs_k$symbol)
+down_heart <- intersect(up_b_vs_h$symbol, down_h_vs_k$symbol)
+down_kidney <- intersect(up_b_vs_k$symbol, up_h_vs_k$symbol)
+
+
+
+### Post processing of this data using GO for enrichment analysis
